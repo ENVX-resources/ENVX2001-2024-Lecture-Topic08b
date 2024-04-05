@@ -1,0 +1,691 @@
+---
+title: "Regression model development"
+subtitle: "ENVX2001 - Applied Statistical Methods"
+author:
+  - name: Liana Pozza
+    affiliations: The University of Sydney
+date: last-modified
+self-contained: true
+execute:
+  freeze: auto
+  cache: false
+# NOTE: please check _quarto.yml file for more options
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,
+  message = FALSE, 
+  warning = FALSE,
+  cache = TRUE)
+library(tidyverse)
+ggplot2::theme_set(cowplot::theme_half_open())
+# ggplot2::theme_set(ggplot2::theme_minimal())
+```
+
+
+# Variable selection
+
+> "The hardest thing to learn in life is which bridge to cross and which to burn."
+
+-- [David Russell](https://en.wikipedia.org/wiki/David_Russell_(guitarist))
+
+
+## Last lecture...
+
+- Model *development*.
+- Model transformations: e.g. Log-linear, Linear-log, Log-log.
+- Model diagnostics: Residuals.
+- Model interpretation: Coefficients.
+
+. . .
+
+### This week
+
+- Variable selection: partial F-test, stepwise regression.
+- Model disagnostics: Cook's distance/leverage.
+
+## Previously on ENVX2001... {auto-animate="true"}
+
+
+We fitted a multiple linear regression model to the data (slide 62).
+
+```{r}
+#| message=FALSE, warning=FALSE
+library(tidyverse)
+multi_fit <- lm(log(Ozone) ~ Temp + Solar.R + Wind, data = airquality)
+summary(multi_fit)
+```
+
+$$\widehat{log(Ozone)}=-0.262 + 0.0492 \cdot Temp + 0.00252 \cdot Solar.R - 0.0616 \cdot Wind$$
+
+## Question {auto-animate="true"}
+
+$$\widehat{log(Ozone)}=-0.262 + 0.0492 \cdot Temp + 0.00252 \cdot Solar.R - 0.0616 \cdot Wind$$
+
+. . .
+
+**Are all the variables/predictors needed?**
+
+. . .
+
+ 
+### Principles
+
+A good model:
+
+- Has only *useful* predictors: principle of parsimony
+- Has *no redundant* predictors: principle of orthogonality (no multicollinearity)
+- Is *interpretable* (principle of transparency; last week), or *predicts* well (principle of accuracy; next week)
+
+## On the principle of parsimony
+
+- [Ockham's razor](https://en.wikipedia.org/wiki/Occam%27s_razor): "Entities should not be multiplied unnecessarily."
+  - One should prefer the *simplest* explanation that fits the data if multiple explanations are equally good.
+
+> "It is vain to do with more what can be done with fewer."
+
+-- [William of Ockham](https://en.wikipedia.org/wiki/William_of_Ockham) (1287--1347)
+
+## Variance-bias trade-off
+
+- The more predictors we include, the more variance we can explain.
+- However, the more predictors we include, *the more bias we introduce*.
+
+### Simulated data
+
+What happens when we add more predictors to a model?
+
+A simple example using polynomial regression.
+
+```{r}
+#| code-fold: true
+
+library(tidyverse)
+set.seed(1030)
+xsquared <- function(x) {
+  x ^ 2
+}
+# Generate xy data
+sim_data <- function(xsquared, sample_size = 100) {
+  x = runif(n = sample_size, min = 0, max = 1) 
+  y = rnorm(n = sample_size, mean = xsquared(x), sd = 0.05)
+  data.frame(x, y)
+}
+# Generate predicted data (model)
+df = sim_data(xsquared, sample_size = 60)
+fit_1 <- lm(y ~ 1, data = df)
+fit_2 <- lm(y ~ poly(x, degree = 1), data = df)
+fit_3 <- lm(y ~ poly(x, degree = 2), data = df)
+fit_many <- lm(y ~ poly(x, degree = 20), data = df)
+truth <- seq(from = 0, to = 1, by = 0.01)
+# Combine the data and model fits into a single data frame
+df <- data.frame(
+  x = df$x,
+  y = df$y,
+  fit_1 = predict(fit_1),
+  fit_2 = predict(fit_2),
+  fit_3 = predict(fit_3),
+  fit_many = predict(fit_many)
+)
+```
+
+
+## Variance-bias trade-off
+
+- The more predictors we include, the more variance we can explain.
+- However, the more predictors we include, *the more bias we introduce*.
+
+```{r}
+#| code-fold: true
+
+# Reshape the data frame into long format
+df_long <- pivot_longer(
+  df, 
+  cols = starts_with("fit_"),
+  names_to = "model",
+  values_to = "value"
+) %>% 
+  mutate(
+    model = case_when(
+      model == "fit_1" ~ "y = b",
+      model == "fit_2" ~ "y = b + mx",
+      model == "fit_3" ~ "y = b + mx + nx^2",
+      model == "fit_many" ~ "y = b + mx + nx^2 + ... + zx^20",
+      TRUE ~ model
+    )
+  )
+# Plot
+p <- ggplot(df_long, aes(x = x, y = value, color = model)) +
+  facet_wrap(~ model, ncol = 2, scales = "free") +
+  geom_point(aes(y = y), alpha = .4, size = 2) +
+  geom_line(linewidth = .9, linetype = 1) +
+  scale_color_brewer(palette = "Set1") +
+  theme(legend.position = "none") +
+  geom_blank()
+p
+```
+
+---
+
+```{r}
+#| echo: false
+p
+```
+
+- As complexity increases, bias *decreases* (the mean of a model’s predictions is closer to the true mean). However, it may (sometimes) increase again if the model is too complex.
+- As complexity increases, variance (the variance about the mean of a model’s predictions) *may first* decrease, but it *increases* as the predictions become more *wild*.
+- The **goal** is to find a model that isn't too complex, and also has a "balance" between **bias and variance**.
+
+## Bias-variance plot
+
+![](assets/bias_var.svg)
+
+## How do we determine the best model?
+
+- **Partial F-test**: compare the full model to a reduced model, works well when the number of predictors is small and models are *nested* (more on this later).
+- **Stepwise regression**: add/remove predictors one at a time, works well when the number of predictors is large and the main aim is to **interpret** the model.
+- **Cross-validation**: leave-one-out, k-fold, etc., works well when the number of predictors is large and main aim is to **predict** the model. *Note: can be used with stepwise regression.*
+
+# Partia F-test
+
+## Air quality: can we reduce the number of predictors? {auto-animate="true"}
+
+### Full model:
+```{r}
+summary(multi_fit)
+```
+
+- 3 predictors: `Temp`, `Solar.R`, `Wind`
+- `Wind` has the highest p-value, can we remove it?
+- Full model: multiple R-squared = 0.66, adjusted R-squared = 0.66
+
+## {auto-animate="true"}
+
+- `Wind` has the highest p-value, can we remove it?
+- Full model: multiple R-squared = 0.66, adjusted R-squared = 0.66
+
+. . .
+
+### Reduced model: take out `Wind`
+```{r}
+reduced_fit <- lm(log(Ozone) ~ Temp + Solar.R, data = airquality)
+summary(reduced_fit)
+```
+
+. . .
+
+- Reduced model: multiple R-squared = 0.62, adjusted R-squared = 0.61
+- **Adjusted R-squared is lower, but is a 0.04 difference "worth it"?**
+
+(As the full model has a higher adjusted R-squared, we can already conclude that the full model is better than the reduced model, but let's answer the question anyway.)
+
+## The r^2^ value
+
+The R-squared value is the proportion of variance explained by the model.
+
+$$ r^2 = \frac{SS_{reg}}{SS_{tot}} = 1 - \frac{SS_{res}}{SS_{tot}} $$
+
+The adjusted R-squared value is the proportion of variance explained by the model, adjusted for the number of predictors.
+
+$$ r^2_{adj} = 1 - \frac{SS_{res}}{SS_{tot}} \frac{n-1}{n-p-1} $$
+
+where $n$ is the number of observations and $p$ is the number of predictors.
+
+:::{.callout-tip}
+The $r^2$ value does not change when we add or remove predictors (i.e. contains *no* information about model complexity), but the adjusted $r^2$ value does.
+:::
+
+## Partial F-test {auto-animate="true"}
+
+How much of an improvement in adjusted $r^2$ is worth having an extra variable / more complex model?
+
+- We can perform a hypothesis test to determine whether the improvement is significant.
+- The **partial F-test** compares the full model to a reduced model in terms of the trade-off between model complexity and variance explained (i.e. **adjusted $r^2$**).
+  - $H_0$: no significant difference between the full and reduced models
+  - $H_1$: the full model is significantly better than the reduced model
+  - Calculating the F-stat:
+
+$$F = \big| \frac{SS_{reg,full} - SS_{reg,reduced}}{(df_{res,full} - df_{res,reduced})} \big | \div MS_{res, full}$$
+
+## Partial F-test: calculation {auto-animate="true"}
+
+$$F = \big| \frac{SS_{reg,full} - SS_{reg,reduced}}{(df_{res,full} - df_{res,reduced})} \big | \div MS_{res, full}$$
+
+:::: {.columns}
+::: {.column width="50%"}
+```{r}
+full <- anova(multi_fit) %>% broom::tidy()
+full
+reduced <- anova(reduced_fit) %>% broom::tidy()
+reduced
+```
+:::
+::: {.column width="50%"}
+- $SS_{reg,full} = 45.8 + 5.07 + 3.97 = 54.84$
+- $SS_{reg,reduced} = 45.8 + 5.07 = 50.87$
+- $df_{res,full} = 107$
+- $df_{res,reduced} = 108$
+
+$F = |\frac{54.84 - 50.87}{(107-108)}| \div 0.259 = 15.35$
+
+:::
+::::
+
+## 
+
+In R (manually):
+
+```{r}
+regss_full <- sum(full$sumsq[1:3])
+regss_reduced <- sum(reduced$sumsq[1:2])
+resdf_full <- full$df[4]
+resdf_reduced <- reduced$df[3]
+resms_full <- full$meansq[4]
+F <- abs((regss_full - regss_reduced) / ((resdf_full - resdf_reduced))) / resms_full
+F
+pf(F, df1 = 1, df2 = resdf_full, lower.tail = FALSE)
+```
+
+. . .
+
+Alternatively (using functions):
+```{r}
+pf_result <- anova(multi_fit, reduced_fit)
+pf_result
+```
+
+- The partial F-test is significant (p-value < 0.05), so we can reject the null hypothesis and conclude that the full model is significantly better (as expected)
+
+
+## But wait... {auto-animate="true"}
+
+. . .
+
+Looking back at the original model, we can see that the partial regression coefficients are the *same* as the partial F-test results!
+
+```{r}
+pf_result
+full
+```
+
+This is because the reduced model is *nested* within the full model so the partial F-test is equivalent to a partial regression coefficient test.
+
+## Nested models
+
+- Previous example is a simple example of a **nested model**.
+- A model is nested within another model if the predictors in the first model are a subset of the predictors in the second model.
+- This makes comparing the two models easier, as we can compare the regression coefficients of the two models.
+
+. . .
+
+### Example
+
+- If the original model is y ~ a + b + c + d:
+  - Nested: y ~ a + b + c
+  - Nested: y ~ a + b
+  - *Not* nested: y ~ a + b + **e** -- because **e** is not in the full model
+
+
+:::{.callout-important}
+**Partial F-tests will *only* make sense/work for nested models!**
+::: 
+
+# Another example: Bird abundance
+
+## About
+
+```{r}
+loyn <-read_csv("assets/loyn.csv") 
+```
+
+- Can we predict the abundance of birds in forrest patches cleared for agriculture, based on patch size, area, grazing and other variables?
+- Loyn ([1987](https://www.researchgate.net/profile/Richard-Loyn/publication/279541149_Effects_of_patch_area_and_habitat_on_bird_abundances_species_numbers_and_tree_health_in_fragmented_Victoria_forests/links/563ae1bc08ae337ef2985592/Effects-of-patch-area-and-habitat-on-bird-abundances-species-numbers-and-tree-health-in-fragmented-Victoria-forests.pdf))
+  - DIST: Distance to nearest patch (km)
+  - LDIST: Distance to a larger patch (km)
+  - AREA: Patch area (ha)
+  - GRAZE: Grazing pressure 1(light) – 5 (heavy) – ALT: Altitude (m)
+  - YR.ISOL: Years since isolation (years)
+
+## Full model
+
+```{r}
+glimpse(loyn)
+loyn_fit <- lm(ABUND ~ ., data = loyn)
+summary(loyn_fit)
+```
+
+## Wait! Before we go on...
+
+. . .
+
+```{r}
+summary(loyn)
+```
+
+- The predictors are on very different scales, which can cause problems for the model.
+- Transforming the predictors can help.
+
+. . .
+
+:::{.callout-tip}
+Transforming predictors can help with model fitting but it is also optional -- you can still fit a model without transforming predictors. An advantage of transforming predictors is that it may help with leverage and outlier issues.
+:::
+
+## Before transformation
+
+```{r}
+loyn %>%
+  pivot_longer(-ABUND) %>%
+  ggplot(aes(value)) +
+  geom_histogram() +
+  facet_wrap(~name, scales = "free")
+```
+
+- We will perform log~10~ transforms of `AREA`, `LDIST`, and `DIST`.
+
+## Log~10~ transformation
+
+```{r}
+#| code-fold: true
+#| cache: true
+# perform transformations
+loyn <- loyn %>%
+  mutate(AREA_L10 = log10(AREA),
+         LDIST_L10 = log10(LDIST),
+         DIST_L10 = log10(DIST))
+
+# View distributions again
+loyn %>%
+  select(-ALT, -GRAZE, -YR.ISOL) %>%
+  pivot_longer(-ABUND) %>%
+  ggplot(aes(value)) +
+  geom_histogram() +
+  facet_wrap(~name, scales = "free", ncol = 2)
+  
+```
+
+## Effect of transformation on pairwise relationships
+
+```{r}
+#| code-fold: true
+#| cache: true
+# generate xy scatterplot of AREA, DIST, and LDIST, plust their log10 transformations, against ABUND
+loyn %>%
+  select(-ALT, -GRAZE, -YR.ISOL) %>%
+  pivot_longer(-ABUND) %>%
+  ggplot(aes(value, ABUND)) +
+  geom_point(linesize = 1) +
+  geom_smooth(method = "lm") +
+  facet_wrap(~name, scales = "free", ncol = 2)
+```
+
+## Transformed model
+  
+```{r}
+loyn_logfit <- lm(ABUND ~ . - AREA - LDIST - DIST, data = loyn)
+summary(loyn_logfit)
+```
+
+## Checking assumptions
+
+Before:
+
+```{r}
+performance::check_model(loyn_fit)
+```
+
+## Checking assumptions
+
+After:
+
+```{r}
+performance::check_model(loyn_logfit)
+```
+
+# Other (important) checks
+Once we enter the realm of multivariate statistics, there are a number of other checks that we should perform to ensure that our model is appropriate for our data.
+
+## Leverage
+
+- The leverage plot shows the influence of each observation (i.e. point) on the model.
+- Points with high leverage can have a large effect on the model when removed.
+- Identified by the Cook's distance statistic -- named after the American statistician R. Dennis Cook, who introduced the concept in 1977.
+
+:::{.callout-tip}
+The leverage plot is a useful tool for identifying outliers and influential points, but can also be used to check for other issues such as heteroskedasticity (equal variances) and non-linearity!
+:::
+
+## Reading the leverage plot
+
+```{r}
+par(mfrow = c(1,2))
+plot(loyn_logfit, which = c(4,5))
+```
+
+-Visually, points with Cook's distance > 0.5 are considered influential by default, but this is a somewhat arbitrary threshold.
+- In practice, you should use a threshold that is appropriate for your data and model.
+
+## Outlier detection using `performance`
+
+```{r}
+performance::check_model(loyn_logfit, check = c("outliers", "pp_check"))
+```
+
+```{r}
+performance::check_outliers(loyn_logfit)
+```
+
+## Variance inflation factors
+
+- VIFs are a measure of the amount of collinearity in the model.
+- Sometimes easier to interpret than pairwise correlation coefficients.
+
+```{r}
+cor(loyn)
+```
+
+```{r}
+car::vif(loyn_logfit)
+```
+
+- $1$ = no correlation with other predictors
+- $>10$ is a sign for high, not tolerable correlation of model predictors which need to be removed and the model refitted
+
+
+## Variance inflation factors using `performance`
+
+```{r}
+vif <- performance::check_collinearity(loyn_logfit)
+vif
+```
+
+:::{.callout-note}
+Tolerance is the reciprocal of VIF
+:::
+
+## Visualising VIF
+
+
+```{r}
+plot(performance::check_collinearity(loyn_logfit))
+```
+
+
+## The best model?
+
+```{r}
+#| code-fold: true
+
+library(broom)
+full6 <- loyn_logfit
+part5 <- update(full6, . ~ . - LDIST_L10)
+part4 <- update(part5, . ~ . - DIST_L10)
+part3 <- update(part4, . ~ . - ALT)
+part2 <- update(part3, . ~ . - YR.ISOL)
+part1 <- update(part2, . ~ . - GRAZE)
+
+formulas <- c(part1$call$formula, 
+              part2$call$formula, 
+              part3$call$formula, 
+              part4$call$formula, 
+              part5$call$formula, 
+              loyn_logfit$call$formula)
+formulas <-
+  c("ABUND ~ AREA_L10",
+    "ABUND ~ AREA_L10 + GRAZE",
+    "ABUND ~ AREA_L10 + GRAZE + YR.ISOL",
+    "ABUND ~ AREA_L10 + GRAZE + YR.ISOL + ALT",
+    "ABUND ~ AREA_L10 + GRAZE + YR.ISOL + ALT + DIST_L10",
+    "ABUND ~ AREA_L10 + GRAZE + YR.ISOL + ALT + DIST_L10 + LDIST_L10")
+
+rs <- bind_rows(glance(part1), 
+          glance(part2), 
+          glance(part3), 
+          glance(part4),
+          glance(part5), 
+          glance(full6)) %>%
+        mutate(Model = formulas) %>%
+        select(Model, r.squared, adj.r.squared)
+
+knitr::kable(rs)
+
+```
+
+- R-squared increases with addition of predictors.
+- Adj. r-squared *varies* with addition of predictors.
+
+
+## The problem
+
+- Other combinations of predictors exist but are not shown.
+- Need *automated way* to select the best model -- 6 predictors gives us 6! = **720 models** to choose from!
+- Two options:
+  - Backward elimination
+  - Forward selection (not covered in this course)
+
+:::{.callout-note}
+We focus on backward elimination here, but forward selection is also a viable option that is **not** covered in this course.
+:::
+
+# Backward elimination
+
+## Steps for backward elimination
+
+1. Start with full model.
+2. For each predictor, test the effect of its removal on the model fit.
+3. Remove the predictor that has the *least* effect on the model fit i.e. the **least informative** predictor, unless it is nonetheless supplying significant information about the response.
+4. Repeat steps 2 and 3 until no predictors can be removed without significantly affecting the model fit.
+
+In backward selection, the model fit is assessed using the Akaike Information Criterion (AIC) or the Bayesian Information Criterion (BIC). **Here we focus on the AIC.**
+
+## In R
+
+```{r}
+back_step <- step(loyn_logfit, direction = "backward")
+```
+
+Before we interpret... let's look at the new column, **AIC**.
+
+# Akaike Information Criterion (AIC)
+
+## History of AIC
+
+$$AIC = 2k - 2\ln(L)$$
+
+- Most **popular** model selection criterion.
+- Developed by [Hirotsugu Akaike](https://en.wikipedia.org/wiki/Hirotugu_Akaike) under the name of "an information criterion" (AIC)
+- Founded on information theory which is concerned with the transmission, processing, utilization, and extraction of information.
+
+## Formula {auto-animate="true"}
+
+$$AIC = 2k - 2\ln(L)$$
+
+where $k$ is the number of parameters in the model and $L$ is the maximum value of the likelihood function. When used in linear regression, the AIC can also be defined as:
+
+$$AIC = n\log(\frac{RSS}{n}) + 2k$$
+
+where $RSS$ is the residual sum of squares and $2k$ is the number of parameters in the model (i.e. model complexity).
+
+## Interpretation {auto-animate="true"}
+
+$$AIC = n\log(\frac{RSS}{n}) + 2k$$
+
+- The AIC is a measure of the **relative quality** or **goodness of fit** of a statistical model for a given set of data.
+- It estimates the **relative amount of information** lost by a given model when it is used to approximate the true underlying process that generated the data.
+- **The smaller the AIC, the better the model fits the data.**
+- A *relative* measure and *unitless*, so it is not worth trying to interpret alone.
+
+## Back to our example
+
+```{r}
+back_step <- step(loyn_logfit, direction = "backward")
+```
+Printing `back_step` reveals the final model:
+
+```{r}
+back_step
+```
+
+## Backward elimination: coefficients
+
+### Full model
+
+```{r}
+#| code-fold: true
+sjPlot::tab_model(
+  loyn_logfit, back_step, 
+  show.ci = FALSE, 
+  show.aic = TRUE,
+  dv.labels = c("Full model",
+                "Backward model")
+)
+```
+
+The backward model retains more explanatory power than the full model!
+
+# Summary
+
+## Model selection
+
+### Model development
+1. Start with full model and check assumptions (e.g. normality, homoscedasticity, linearity, etc.).
+2. Look for additional issues (e.g. multicollinearity, outliers, etc.) - look at correlations, leverage, VIF plots.
+3. Consider transformations (e.g. log, sqrt, etc.).
+4. Test assumptions again.
+
+### Model selection
+
+5. Use VIF as an initial step to get rid of highly correlated predictors.
+6. Perform variable selection using backward elimination (good and fast), because:
+   - Using r~2~ as a criterion is *not* recommended (it is not a good measure of model fit, only a good measure of variance explained). 
+   - Using adjuster r~2~ is better, but has the same issue as r~2~.
+   - Using partial F-test is good, but slow.
+
+# Next lecture
+
+## Next lecture: model interpretation and prediction
+
+- How to incorporate cross-validation into your workflow
+- Determining prediction intervals and performance metrics
+
+
+
+<!-- 
+## Abalone
+
+```{r}
+# load abalone data
+library(AppliedPredictiveModeling)
+data(abalone)
+glimpse(abalone)
+```
+
+Can we predict the age of abalone from physical measurements? -->
+
+
+
+# Thanks!
+
+**Questions? Comments?**
+
+Slides made with [Quarto](https://quarto.org)
